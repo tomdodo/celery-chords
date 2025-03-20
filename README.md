@@ -11,6 +11,6 @@ To run this
 To run a task, from a python console import the task function and use its `delay()` method, for example:
 
 ```python
-from worker import process_node
-process_node.delay()
+from worker import process_tree
+process_tree.delay()
 ```

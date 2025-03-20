@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import Optional, List
 
-from celery import Celery, Task
+from celery import Celery, Task, chord
 from redis import Redis
 
 REDIS_URL = "redis://127.0.0.1:6379"
@@ -10,6 +10,7 @@ CELERY_RESULTS_REDIS_DATABASE = 2
 celery = Celery(
     __name__,
     broker=f"{REDIS_URL}/{CELERY_BROKER_REDIS_DATABASE}",
+    # Must configure results backend - otherwise Chords won't work
     result_backend=f"{REDIS_URL}/{CELERY_RESULTS_REDIS_DATABASE}",
 )
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
@@ -18,7 +19,7 @@ ROOT = "root"
 TREE = {
     ROOT: {
         "branches": ["A", "B"],
-        "users": list(range(0, 19)),
+        "users": list(range(1, 19)),
     },
     "A": {
         "branches": ["C", "D", "E"],
@@ -52,21 +53,52 @@ TREE = {
 VISITED_USERS_SET_NAME = "visited-users"
 
 
+def _mark_user_visited(*users):
+    return redis.sadd(VISITED_USERS_SET_NAME, *users)
+
+
+def _get_visited_users():
+    return {int(i) for i in redis.smembers(VISITED_USERS_SET_NAME)}
+
+
+def _reset_visited_users():
+    return redis.delete(VISITED_USERS_SET_NAME)
+
+
+# Must configure tasks NOT to ignore results!
+@celery.task(name="process_tree", ignore_result=False)
+def process_tree() -> None:
+    print("*** Process tree starting")
+    _reset_visited_users()
+    callback = on_tree_explored.s()
+    chord(process_node.s(ROOT))(callback)
+
+
 @celery.task(name="process_node", ignore_result=False, bind=True)
-def process_node(self: Task, node_id: Optional[str] = None) -> None:
-    print(f"*** Task {self.name} - processing branch {node_id}")
+def process_node(self: Task, node_id: Optional[str] = None) -> int:
+    print(f"+++ Task {self.name} - processing branch {node_id}")
 
     node_id = node_id or ROOT
-    if node_id == ROOT:
-        redis.delete(VISITED_USERS_SET_NAME)
-
     users = TREE[node_id]["users"]
     if node_id != ROOT:
-        redis.sadd(VISITED_USERS_SET_NAME, *users)
+        _mark_user_visited(*users)
         print(f"\t- Processed users: {users}")
 
     for branch_id in TREE[node_id]["branches"]:
-        process_node.delay(branch_id)
+        self.add_to_chord(process_node.s(branch_id))
+        # This won't work: callback will be called after exploring nodes at depth 1
+        # process_node.delay(branch_id)
 
-    visited_nodes = [int(i) for i in redis.smembers(VISITED_USERS_SET_NAME)]
-    print(f"\t- visited nodes: {sorted(visited_nodes)}")
+    return len(users)
+
+
+@celery.task(name="on_tree_explored", ignore_result=False)
+def on_tree_explored(
+    # list of the return values from each task in the chord (param must be in signature)
+    user_lengths: List[int],
+) -> None:
+    root_users = TREE[ROOT]["users"]
+    visited_users = _get_visited_users()
+    root_users_only = set(root_users).difference(visited_users)
+    print(f"=== on_tree_explored, return value: {user_lengths}")
+    print(f"=== root users only: {root_users_only}")
